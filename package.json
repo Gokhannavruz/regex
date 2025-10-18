@@ -19,7 +19,8 @@
     "docker:prod:down": "docker-compose -f docker-compose.prod.yml down",
     "deploy:prod": "./deploy-prod.sh",
     "deploy:railway": "railway up",
-    "deploy:vercel": "vercel --prod"
+    "deploy:vercel": "vercel --prod",
+    "vercel-build": "vite build"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.4",
