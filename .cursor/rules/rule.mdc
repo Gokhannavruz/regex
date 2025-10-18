@@ -1,0 +1,842 @@
+---
+alwaysApply: true
+---
+# Regex Tester - Complete Full Stack Implementation
+
+## 🏗️ Architecture Overview
+
+```
+Frontend (React) → Backend (Node.js/Express) → Database (PostgreSQL) → AI Service (OpenAI)
+```
+
+---
+
+## 📁 Project Structure
+
+```
+regex-tester/
+├── frontend/                 # React app (Bolt.dev output)
+│   ├── src/
+│   ├── package.json
+│   └── .env
+├── backend/
+│   ├── src/
+│   │   ├── routes/
+│   │   │   ├── auth.js
+│   │   │   ├── regex.js
+│   │   │   └── ai.js
+│   │   ├── models/
+│   │   │   ├── User.js
+│   │   │   └── SavedRegex.js
+│   │   ├── middleware/
+│   │   │   ├── auth.js
+│   │   │   └── rateLimiter.js
+│   │   ├── utils/
+│   │   │   ├── regexParser.js
+│   │   │   └── aiHelper.js
+│   │   └── server.js
+│   ├── package.json
+│   └── .env
+├── docker-compose.yml
+└── README.md
+```
+
+---
+
+## 1️⃣ BACKEND SETUP (Node.js + Express)
+
+### Package Installation
+
+```bash
+cd backend
+npm init -y
+npm install express cors dotenv
+npm install pg sequelize
+npm install bcryptjs jsonwebtoken
+npm install express-rate-limit
+npm install openai
+npm install helmet compression morgan
+npm install --save-dev nodemon
+```
+
+### .env Configuration
+
+```env
+# Server
+PORT=5000
+NODE_ENV=development
+
+# Database
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=regex_tester
+DB_USER=postgres
+DB_PASSWORD=your_password
+
+# JWT
+JWT_SECRET=your_super_secret_key_change_this
+JWT_EXPIRE=7d
+
+# OpenAI (for AI features)
+OPENAI_API_KEY=sk-your-openai-key
+
+# Rate Limiting
+RATE_LIMIT_WINDOW=15
+RATE_LIMIT_MAX_REQUESTS=100
+```
+
+---
+
+## 2️⃣ DATABASE SCHEMA (PostgreSQL)
+
+```sql
+-- Users table
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    username VARCHAR(100),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Saved Regex patterns
+CREATE TABLE saved_regex (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    title VARCHAR(255) NOT NULL,
+    pattern TEXT NOT NULL,
+    flags VARCHAR(10),
+    description TEXT,
+    test_string TEXT,
+    language VARCHAR(50) DEFAULT 'javascript',
+    is_public BOOLEAN DEFAULT false,
+    usage_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Regex library (community shared)
+CREATE TABLE regex_library (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id),
+    title VARCHAR(255) NOT NULL,
+    pattern TEXT NOT NULL,
+    flags VARCHAR(10),
+    description TEXT,
+    category VARCHAR(50),
+    tags TEXT[],
+    upvotes INTEGER DEFAULT 0,
+    views INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Usage analytics
+CREATE TABLE regex_usage (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id),
+    pattern TEXT NOT NULL,
+    language VARCHAR(50),
+    execution_time INTEGER,
+    success BOOLEAN,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Indexes for performance
+CREATE INDEX idx_saved_regex_user ON saved_regex(user_id);
+CREATE INDEX idx_regex_library_category ON regex_library(category);
+CREATE INDEX idx_regex_library_upvotes ON regex_library(upvotes DESC);
+```
+
+---
+
+## 3️⃣ BACKEND CODE
+
+### server.js
+
+```javascript
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const compression = require('compression');
+const morgan = require('morgan');
+require('dotenv').config();
+
+const authRoutes = require('./routes/auth');
+const regexRoutes = require('./routes/regex');
+const aiRoutes = require('./routes/ai');
+
+const app = express();
+
+// Middleware
+app.use(helmet());
+app.use(compression());
+app.use(cors({
+    origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+    credentials: true
+}));
+app.use(express.json());
+app.use(morgan('combined'));
+
+// Routes
+app.use('/api/auth', authRoutes);
+app.use('/api/regex', regexRoutes);
+app.use('/api/ai', aiRoutes);
+
+// Health check
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', timestamp: new Date() });
+});
+
+// Error handling
+app.use((err, req, res, next) => {
+    console.error(err.stack);
+    res.status(500).json({ 
+        error: 'Something went wrong!',
+        message: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+});
+```
+
+### routes/regex.js
+
+```javascript
+const express = require('express');
+const router = express.Router();
+const { authenticate } = require('../middleware/auth');
+const { regexRateLimit } = require('../middleware/rateLimiter');
+const { parseRegex, testRegex, explainRegex } = require('../utils/regexParser');
+const db = require('../db');
+
+// Test regex (public, rate-limited)
+router.post('/test', regexRateLimit, async (req, res) => {
+    try {
+        const { pattern, flags, testString, language } = req.body;
+
+        // Validate input
+        if (!pattern || !testString) {
+            return res.status(400).json({ error: 'Pattern and test string required' });
+        }
+
+        // Test regex in specified language
+        const result = await testRegex(pattern, flags, testString, language);
+
+        // Track usage (anonymous)
+        if (req.user) {
+            await db.query(
+                'INSERT INTO regex_usage (user_id, pattern, language, success) VALUES ($1, $2, $3, $4)',
+                [req.user.id, pattern, language, result.success]
+            );
+        }
+
+        res.json(result);
+    } catch (error) {
+        res.status(400).json({ 
+            error: 'Invalid regex pattern',
+            message: error.message 
+        });
+    }
+});
+
+// Explain regex
+router.post('/explain', async (req, res) => {
+    try {
+        const { pattern } = req.body;
+        const explanation = explainRegex(pattern);
+        res.json({ explanation });
+    } catch (error) {
+        res.status(400).json({ error: error.message });
+    }
+});
+
+// Save regex (authenticated)
+router.post('/save', authenticate, async (req, res) => {
+    try {
+        const { title, pattern, flags, description, testString, language } = req.body;
+        
+        const result = await db.query(
+            `INSERT INTO saved_regex 
+            (user_id, title, pattern, flags, description, test_string, language) 
+            VALUES ($1, $2, $3, $4, $5, $6, $7) 
+            RETURNING *`,
+            [req.user.id, title, pattern, flags, description, testString, language]
+        );
+
+        res.json({ saved: result.rows[0] });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to save regex' });
+    }
+});
+
+// Get user's saved regex
+router.get('/saved', authenticate, async (req, res) => {
+    try {
+        const result = await db.query(
+            'SELECT * FROM saved_regex WHERE user_id = $1 ORDER BY created_at DESC',
+            [req.user.id]
+        );
+        res.json({ patterns: result.rows });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to fetch saved patterns' });
+    }
+});
+
+// Delete saved regex
+router.delete('/saved/:id', authenticate, async (req, res) => {
+    try {
+        await db.query(
+            'DELETE FROM saved_regex WHERE id = $1 AND user_id = $2',
+            [req.params.id, req.user.id]
+        );
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to delete pattern' });
+    }
+});
+
+// Community library
+router.get('/library', async (req, res) => {
+    try {
+        const { category, search } = req.query;
+        
+        let query = 'SELECT * FROM regex_library WHERE 1=1';
+        const params = [];
+        
+        if (category) {
+            params.push(category);
+            query += ` AND category = $${params.length}`;
+        }
+        
+        if (search) {
+            params.push(`%${search}%`);
+            query += ` AND (title ILIKE $${params.length} OR description ILIKE $${params.length})`;
+        }
+        
+        query += ' ORDER BY upvotes DESC LIMIT 50';
+        
+        const result = await db.query(query, params);
+        res.json({ patterns: result.rows });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to fetch library' });
+    }
+});
+
+module.exports = router;
+```
+
+### routes/ai.js
+
+```javascript
+const express = require('express');
+const router = express.Router();
+const OpenAI = require('openai');
+const { authenticate } = require('../middleware/auth');
+const { aiRateLimit } = require('../middleware/rateLimiter');
+
+const openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY
+});
+
+// Generate regex from description
+router.post('/generate', authenticate, aiRateLimit, async (req, res) => {
+    try {
+        const { description, language } = req.body;
+
+        const prompt = `Generate a ${language || 'JavaScript'} regular expression for: "${description}"
+
+Rules:
+1. Return ONLY the regex pattern (no delimiters like / /)
+2. If flags are needed, specify them separately
+3. Provide a brief explanation
+4. Give 2-3 example test strings that should match
+
+Format your response as JSON:
+{
+  "pattern": "the regex pattern",
+  "flags": "flags like g, i, m",
+  "explanation": "what this regex does",
+  "examples": ["example1", "example2"]
+}`;
+
+        const completion = await openai.chat.completions.create({
+            model: "gpt-4",
+            messages: [
+                { role: "system", content: "You are a regex expert. Generate accurate regex patterns." },
+                { role: "user", content: prompt }
+            ],
+            temperature: 0.3,
+            max_tokens: 500
+        });
+
+        const response = JSON.parse(completion.choices[0].message.content);
+        res.json(response);
+    } catch (error) {
+        console.error('AI Error:', error);
+        res.status(500).json({ 
+            error: 'Failed to generate regex',
+            message: error.message 
+        });
+    }
+});
+
+// Improve existing regex
+router.post('/improve', authenticate, aiRateLimit, async (req, res) => {
+    try {
+        const { pattern, issue } = req.body;
+
+        const prompt = `Improve this regex pattern: "${pattern}"
+Issue: ${issue}
+
+Suggest improvements and return:
+{
+  "improved_pattern": "better regex",
+  "changes": "what was changed and why",
+  "performance": "any performance improvements"
+}`;
+
+        const completion = await openai.chat.completions.create({
+            model: "gpt-4",
+            messages: [
+                { role: "system", content: "You are a regex optimization expert." },
+                { role: "user", content: prompt }
+            ],
+            temperature: 0.3
+        });
+
+        const response = JSON.parse(completion.choices[0].message.content);
+        res.json(response);
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to improve regex' });
+    }
+});
+
+module.exports = router;
+```
+
+### utils/regexParser.js
+
+```javascript
+// Test regex in multiple languages
+function testRegex(pattern, flags, testString, language = 'javascript') {
+    const startTime = Date.now();
+    
+    try {
+        let regex;
+        let matches = [];
+        
+        switch (language.toLowerCase()) {
+            case 'javascript':
+                regex = new RegExp(pattern, flags || '');
+                matches = [...testString.matchAll(new RegExp(pattern, flags?.includes('g') ? flags : (flags || '') + 'g'))];
+                break;
+                
+            case 'python':
+                // For Python, we'd need to translate some syntax differences
+                // This is a simplified version
+                regex = new RegExp(pattern.replace(/\(\?P<(\w+)>/g, '(?<$1>'), flags || '');
+                matches = [...testString.matchAll(regex)];
+                break;
+                
+            default:
+                regex = new RegExp(pattern, flags || '');
+                matches = [...testString.matchAll(new RegExp(pattern, (flags || '') + 'g'))];
+        }
+        
+        const executionTime = Date.now() - startTime;
+        
+        return {
+            success: true,
+            matches: matches.map(m => ({
+                match: m[0],
+                index: m.index,
+                groups: m.groups || {}
+            })),
+            matchCount: matches.length,
+            executionTime,
+            isValid: true
+        };
+    } catch (error) {
+        return {
+            success: false,
+            error: error.message,
+            isValid: false
+        };
+    }
+}
+
+// Explain regex pattern
+function explainRegex(pattern) {
+    const explanations = [];
+    
+    const tokens = [
+        { regex: /\^/, explanation: 'Start of line/string' },
+        { regex: /\$/, explanation: 'End of line/string' },
+        { regex: /\\d/, explanation: 'Any digit (0-9)' },
+        { regex: /\\D/, explanation: 'Any non-digit' },
+        { regex: /\\w/, explanation: 'Any word character (a-z, A-Z, 0-9, _)' },
+        { regex: /\\W/, explanation: 'Any non-word character' },
+        { regex: /\\s/, explanation: 'Any whitespace character' },
+        { regex: /\\S/, explanation: 'Any non-whitespace character' },
+        { regex: /\./, explanation: 'Any character except newline' },
+        { regex: /\+/, explanation: 'One or more of the preceding token' },
+        { regex: /\*/, explanation: 'Zero or more of the preceding token' },
+        { regex: /\?/, explanation: 'Zero or one of the preceding token' },
+        { regex: /\{(\d+)\}/, explanation: 'Exactly $1 of the preceding token' },
+        { regex: /\{(\d+),\}/, explanation: 'At least $1 of the preceding token' },
+        { regex: /\{(\d+),(\d+)\}/, explanation: 'Between $1 and $2 of the preceding token' },
+        { regex: /\[([^\]]+)\]/, explanation: 'Any character in the set: $1' },
+        { regex: /\(([^)]+)\)/, explanation: 'Capturing group: $1' },
+        { regex: /\(\?:([^)]+)\)/, explanation: 'Non-capturing group: $1' },
+        { regex: /\|/, explanation: 'OR - matches either left or right side' }
+    ];
+    
+    let position = 0;
+    while (position < pattern.length) {
+        let matched = false;
+        
+        for (const token of tokens) {
+            const match = pattern.substring(position).match(token.regex);
+            if (match && match.index === 0) {
+                explanations.push({
+                    token: match[0],
+                    explanation: token.explanation.replace(/\$(\d+)/g, (_, i) => match[i])
+                });
+                position += match[0].length;
+                matched = true;
+                break;
+            }
+        }
+        
+        if (!matched) {
+            if (pattern[position] !== '\\') {
+                explanations.push({
+                    token: pattern[position],
+                    explanation: `Literal character: "${pattern[position]}"`
+                });
+            }
+            position++;
+        }
+    }
+    
+    return explanations;
+}
+
+module.exports = {
+    testRegex,
+    explainRegex
+};
+```
+
+---
+
+## 4️⃣ AUTHENTICATION
+
+### routes/auth.js
+
+```javascript
+const express = require('express');
+const router = express.Router();
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const db = require('../db');
+
+// Register
+router.post('/register', async (req, res) => {
+    try {
+        const { email, password, username } = req.body;
+        
+        // Check if user exists
+        const existingUser = await db.query(
+            'SELECT * FROM users WHERE email = $1',
+            [email]
+        );
+        
+        if (existingUser.rows.length > 0) {
+            return res.status(400).json({ error: 'Email already registered' });
+        }
+        
+        // Hash password
+        const passwordHash = await bcrypt.hash(password, 10);
+        
+        // Create user
+        const result = await db.query(
+            'INSERT INTO users (email, password_hash, username) VALUES ($1, $2, $3) RETURNING id, email, username',
+            [email, passwordHash, username]
+        );
+        
+        const user = result.rows[0];
+        
+        // Generate JWT
+        const token = jwt.sign(
+            { id: user.id, email: user.email },
+            process.env.JWT_SECRET,
+            { expiresIn: process.env.JWT_EXPIRE }
+        );
+        
+        res.json({ token, user });
+    } catch (error) {
+        res.status(500).json({ error: 'Registration failed' });
+    }
+});
+
+// Login
+router.post('/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        
+        const result = await db.query(
+            'SELECT * FROM users WHERE email = $1',
+            [email]
+        );
+        
+        if (result.rows.length === 0) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        
+        const user = result.rows[0];
+        const isValid = await bcrypt.compare(password, user.password_hash);
+        
+        if (!isValid) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        
+        const token = jwt.sign(
+            { id: user.id, email: user.email },
+            process.env.JWT_SECRET,
+            { expiresIn: process.env.JWT_EXPIRE }
+        );
+        
+        res.json({
+            token,
+            user: {
+                id: user.id,
+                email: user.email,
+                username: user.username
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ error: 'Login failed' });
+    }
+});
+
+module.exports = router;
+```
+
+### middleware/auth.js
+
+```javascript
+const jwt = require('jsonwebtoken');
+
+function authenticate(req, res, next) {
+    const token = req.headers.authorization?.split(' ')[1];
+    
+    if (!token) {
+        return res.status(401).json({ error: 'Authentication required' });
+    }
+    
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        req.user = decoded;
+        next();
+    } catch (error) {
+        res.status(401).json({ error: 'Invalid token' });
+    }
+}
+
+module.exports = { authenticate };
+```
+
+---
+
+## 5️⃣ RATE LIMITING
+
+### middleware/rateLimiter.js
+
+```javascript
+const rateLimit = require('express-rate-limit');
+
+const regexRateLimit = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100, // 100 requests per window
+    message: 'Too many requests, please try again later'
+});
+
+const aiRateLimit = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 hour
+    max: 10, // 10 AI requests per hour
+    message: 'AI rate limit exceeded'
+});
+
+module.exports = {
+    regexRateLimit,
+    aiRateLimit
+};
+```
+
+---
+
+## 6️⃣ DOCKER SETUP
+
+### docker-compose.yml
+
+```yaml
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: regex_tester
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: your_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  backend:
+    build: ./backend
+    ports:
+      - "5000:5000"
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=regex_tester
+      - DB_USER=postgres
+      - DB_PASSWORD=your_password
+    depends_on:
+      - postgres
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+```
+
+---
+
+## 7️⃣ DEPLOYMENT
+
+### Option 1: Railway.app (Easiest)
+
+```bash
+# Install Railway CLI
+npm i -g @railway/cli
+
+# Login
+railway login
+
+# Initialize
+railway init
+
+# Deploy
+railway up
+```
+
+### Option 2: Vercel (Frontend) + Railway (Backend)
+
+**Frontend (Vercel):**
+```bash
+cd frontend
+vercel
+```
+
+**Backend (Railway):**
+```bash
+cd backend
+railway init
+railway up
+```
+
+### Option 3: DigitalOcean App Platform
+
+1. Connect GitHub repo
+2. Auto-detect Node.js
+3. Add PostgreSQL database
+4. Deploy
+
+---
+
+## 8️⃣ FRONTEND INTEGRATION
+
+### API Service (frontend/src/services/api.js)
+
+```javascript
+const API_BASE = process.env.REACT_APP_API_URL || 'http://localhost:5000/api';
+
+export const testRegex = async (pattern, flags, testString, language) => {
+    const response = await fetch(`${API_BASE}/regex/test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pattern, flags, testString, language })
+    });
+    return response.json();
+};
+
+export const generateRegex = async (description, language) => {
+    const token = localStorage.getItem('token');
+    const response = await fetch(`${API_BASE}/ai/generate`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ description, language })
+    });
+    return response.json();
+};
+
+export const saveRegex = async (data) => {
+    const token = localStorage.getItem('token');
+    const response = await fetch(`${API_BASE}/regex/save`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify(data)
+    });
+    return response.json();
+};
+```
+
+---
+
+## 9️⃣ MONETIZATION FEATURES
+
+### Free Tier:
+- 100 regex tests per day
+- Basic explanation
+- Save up to 5 patterns
+
+### Pro Tier ($5/month):
+- Unlimited tests
+- AI regex generation (10/day)
+- Unlimited saved patterns
+- Community library access
+- Team sharing
+
+### Enterprise ($50/month):
+- API access
+- Custom integrations
+- Priority support
+- Team collaboration
+
+---
+
